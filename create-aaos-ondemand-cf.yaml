@@ -1,0 +1,353 @@
+# Description     : CloudFormation Template for AAOS CI/CD Pipelines on AWS for the Automotive Industry Blog - On Demand Instance
+# Date            : 17/06/2024
+# Current Version : 4
+
+# Version 1 : 25/10/23 - Initial Version uses on-demand instances
+# Version 2 : 04/04/24 - update Cuttlefish build to resolve dependancy issues.
+# Version 3 : 13/06/24 - Updated ready for addition to repo.
+# Version 4 : 17/06/24 - Version for release 
+
+# Instructions:
+# Deploy this using Cloudformation within one of the regions included in the Mapping table below.
+# Ensure to use a Cloudformation Stack Name compliant with a S3 Bucket Name, as it is used name of the S3 Bucket created by this stack.
+# Once the stack has run, check the Stack outputs it will provide the URL of the AAOS Interface.
+# Ensure to delete the objects placed into the S3 Bucket prior to deleting the stack as deletion will fail if bucket is not empty.
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Mappings:
+  RegionMap:
+    ap-northeast-1:
+      buildami: ami-0d52744d6551d851e
+      targetami: ami-0b4630ef8a2b167d9
+    ap-southeast-1:
+      buildami: ami-0df7a207adb9748c7
+      targetami: ami-0e3d9e3a3bac2a3c9
+    eu-west-2:
+      buildami: ami-0eb260c4d5475b901
+      targetami: ami-0b3a47cf79203cd3f
+    eu-west-1:
+      buildami: ami-01dd271720c1ba44f
+      targetami: ami-09e8e9f9b1b4067d9
+    eu-central-1:
+      buildami: ami-04e601abe3e1a910f
+      targetami: ami-058b550e3dc714613
+    us-east-1:
+      buildami: ami-053b0d53c279acc90
+      targetami: ami-06be7c79234a3be48
+    us-east-2:
+      buildami: ami-024e6efaf93d85776
+      targetami: ami-0de2b061fc594daad
+    us-west-2:
+      buildami: ami-03f65b8614a860c29
+      targetami: ami-009c2d20a323f18cb
+
+Resources:
+  AAOSBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub 'aaos-output-${AWS::Region}-${AWS::AccountId}-${AWS::StackName}'
+
+  AAOSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'aaos-role-${AWS::Region}-${AWS::StackName}'    
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  AAOSRolePolicy: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: !Sub 'aaos-policy-${AWS::Region}-${AWS::StackName}' 
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListObject
+              - logs:PutLogEvents
+              - ec2:StopInstances
+            Resource: '*'
+      Roles: 
+        - !Ref AAOSRole
+        
+  AAOSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'AAOSLogs-${AWS::Region}-${AWS::StackName}'
+      RetentionInDays: 1
+      
+  AAOSBuildStream:  
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref AAOSLogGroup
+      LogStreamName: !Sub 'AAOSBuild-${AWS::Region}-${AWS::StackName}'
+      
+  AAOSTargetStream:  
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref AAOSLogGroup
+      LogStreamName: !Sub 'AAOSTarget-${AWS::Region}-${AWS::StackName}'
+  
+  AAOSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Sub 'AAOSInstanceProfile-${AWS::Region}-${AWS::StackName}'
+      Roles: 
+        - !Ref AAOSRole
+        
+  AAOSKeyPair:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: !Sub 'AAOSInstanceKey-${AWS::Region}-${AWS::StackName}'
+      
+  AAOSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'aaos-secgroup-${AWS::Region}-${AWS::StackName}'
+      GroupDescription: 'AAOS Instance Security Group - For Instance Access'
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: '6520'
+          ToPort: '6520'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: 'tcp'
+          FromPort: '8443'
+          ToPort: '8443'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: 'tcp'
+          FromPort: '15550'
+          ToPort: '15599'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: 'udp'
+          FromPort: '15550'
+          ToPort: '15599'
+          CidrIp: 0.0.0.0/0
+    
+  AAOSBuildInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: 
+        Fn::FindInMap: 
+          - RegionMap
+          - !Ref "AWS::Region"
+          - buildami
+      InstanceType: "c6a.8xlarge"
+      KeyName: !Ref AAOSKeyPair
+      SecurityGroups:
+        - !Ref AAOSSG  
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/sda1"
+          Ebs: 
+            VolumeType: "gp3"
+            Iops: "3000"
+            DeleteOnTermination: "true"
+            VolumeSize: "300"
+      IamInstanceProfile: !Ref AAOSInstanceProfile
+      Tags:
+        - Key: "Name"
+          Value: !Sub 'AAOS-${AWS::StackName}-Build'
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))           
+            export GOCACHE=/root/go/cache
+            export DEBIAN_FRONTEND=noninteractive
+            dpkg --configure -a
+            apt-get update
+            apt-get -y --no-install-recommends install awscli
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSBuildStream} --log-events timestamp=$timestamp,message="Step 1 of 5 - AWSCLI Installed"
+            apt-get -y update && apt-get install -y --no-install-recommends build-essential file apt-utils flex bison gperf git vim zip curl ssh zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 x11proto-core-dev libx11-dev lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc unzip libncurses5 uuid uuid-dev zlib1g-dev liblz-dev liblzo2-2 liblzo2-dev lzop u-boot-tools mtd-utils android-sdk-libsparse-utils openjdk-8-jdk device-tree-compiler gdisk m4 libz-dev bc rsync wget apt-transport-https
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSBuildStream} --log-events timestamp=$timestamp,message="Step 2 of 5 - Configuring AAOS Build environement"
+            ulimit -n 4096
+            curl https://storage.googleapis.com/git-repo-downloads/repo > /bin/repo
+            chmod a+x /bin/repo
+            mkdir -p /build/android-12.1.0_r11
+            cd /build/android-12.1.0_r11
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSBuildStream} --log-events timestamp=$timestamp,message="Step 3 of 5 - Configuration Complete and AAOS Source code downloaded - Starting build..."
+            repo init --depth=1 -u https://android.googlesource.com/platform/manifest -b android-12.1.0_r11 < /dev/null
+            repo sync -c -j 2
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSBuildStream} --log-events timestamp=$timestamp,message="Step 4 of 5 - Initial AAOS Build steps completed - Starting final build - This will take up to 90 minutes"
+            cd /build/android-12.1.0_r11
+            pushd device/google/cuttlefish && sed "181 i sig_server.AddParameter(\"-stun_server=\", \"142.250.9.127\");"  host/commands/run_cvd/launch_streamer.cpp > launch_streamer.cpp.patch && cp launch_streamer.cpp.patch host/commands/run_cvd/launch_streamer.cpp && cat  host/commands/run_cvd/launch_streamer.cpp && popd
+            source build/envsetup.sh && lunch aosp_cf_arm64_auto-userdebug && m -j $(nproc) dist
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSBuildStream} --log-events timestamp=$timestamp,message="Step 5 of 5 - Build Complete - Copying built AAOS Images to S3 Bucket"
+            aws s3 cp out/dist/cvd-host_package.tar.gz s3://${AAOSBucket}/
+            aws s3 cp out/dist/aosp_cf_arm64_auto-img-eng.root.zip s3://${AAOSBucket}/images.zip
+            aws s3 cp device/google/cuttlefish_prebuilts/bootloader/crosvm_aarch64/u-boot.bin s3://${AAOSBucket}/
+            aws s3 cp /var/log/cloud-init-output.log s3://${AAOSBucket}/build-cloud-init-output.log
+            
+  AAOSTargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: 
+        Fn::FindInMap: 
+          - RegionMap
+          - !Ref "AWS::Region"
+          - targetami
+      InstanceType: "m6g.metal"
+      KeyName: !Ref AAOSKeyPair
+      SecurityGroups:
+        - !Ref AAOSSG  
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/sda1"
+          Ebs: 
+            VolumeType: "gp3"
+            Iops: "3000"
+            DeleteOnTermination: "true"
+            VolumeSize: "75"
+      IamInstanceProfile: !Ref AAOSInstanceProfile
+      Tags:
+        - Key: "Name"
+          Value: !Sub 'AAOS-${AWS::StackName}-Target'
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            sudo su            
+            export GOCACHE=/root/go/cache
+            export DEBIAN_FRONTEND=noninteractive
+            sed -i \"/#\$nrconf{restart} = 'i';/s/.*/\$nrconf{restart} = 'a';/\" /etc/needrestart/needrestart.conf
+            apt-get update -y
+            apt-get install -y libprotobuf-dev protobuf-compiler nfs-common binutils u-boot-tools
+            apt-get install -y git devscripts config-package-dev debhelper-compat golang libssl-dev
+            apt-get install -y clang meson libfmt-dev libgflags-dev libjsoncpp-dev libcurl4-openssl-dev libgoogle-glog-dev libgtest-dev libxml2-dev uuid-dev libprotobuf-c-dev libz3-dev
+            apt-get install dpkg-dev -y
+            apt-get -y install python3-pip
+            apt-get -y install awscli
+            apt-get -y install unzip
+            #Install and enable CF helper scripts
+            mkdir -p /opt/aws/
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+            /usr/local/bin/cfn-init -v --stack ${AWS::StackName} --resource AAOSTargetInstance --configsets full_install --region ${AWS::Region}
+            # Sync to build ec2
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 1 of 6 - Core Libraries Installed and services running - awaiting sync with build instance"
+            while true; do
+              aws s3 cp s3://${AAOSBucket}/u-boot.bin . 
+              if [ ! -f "u-boot.bin" ]; then
+                echo "File not ready yet!"
+                sleep 60
+              else
+              echo "Found"
+                break
+              fi                
+            done
+            #Clean up build Instance
+            aws ec2 stop-instances --region ${AWS::Region} --instance-ids ${AAOSBuildInstance}
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 2 of 6 - AAOS Build images available - downloading and installing cuttlefish"
+            sleep 5
+            # Sync complete
+            cd ~
+            cd /home/ubuntu
+            git clone https://github.com/google/android-cuttlefish --branch v0.9.27
+            cd android-cuttlefish
+            for dir in base frontend; do
+              pushd $dir
+              mk-build-deps -i
+              dpkg-buildpackage -uc -us
+              popd
+            done
+            apt install -y ./cuttlefish-base_*.deb  
+            apt install -y ./cuttlefish-user_*.deb     
+            usermod -aG kvm,cvdnetwork,render ubuntu
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 3 of 6 - Cuttlefish installed - unpacking and configuring AAOS Build images"
+            cd /home/ubuntu
+            mkdir /home/ubuntu/stage
+            cd /home/ubuntu/stage
+            aws s3 cp s3://${AAOSBucket}/cvd-host_package.tar.gz .
+            aws s3 cp s3://${AAOSBucket}/images.zip .
+            tar xvf ./cvd-host_package.tar.gz
+            unzip ./images.zip
+            aws s3 cp s3://${AAOSBucket}/u-boot.bin ./bootloader
+            cp /usr/bin/mkenvimage ./bin/mkenvimage
+            chown -R ubuntu:ubuntu /home/ubuntu/stage
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 4 of 6 - Creating and Starting Cuttlefish Service"
+            cat <<EOF >>/etc/systemd/system/cvd.service
+            [Unit]
+            Description=Cuttlefish Virtual Device
+            After=multi-user.target
+            [Service]
+            Environment='HOME=/home/ubuntu/stage'
+            Type=simple
+            User=ubuntu
+            Group=ubuntu
+            ExecStart=/bin/sh -c 'yes Y | /home/ubuntu/stage/bin/launch_cvd'
+            ExecStop=/home/ubuntu/stage/bin/stop_cvd
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            chmod 644 /etc/systemd/system/cvd.service
+            systemctl daemon-reload
+            systemctl enable cvd.service
+            systemctl restart cvd.service
+            systemctl status cvd.service
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 5 of 6 - Cuttlefish Service is running"
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            WEBIP="$(curl http://169.254.169.254/latest/meta-data/public-ipv4)"
+            WEBFULL="AAOS Interface Address : https://$WEBIP:8443"
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="$WEBFULL"
+            timestamp=$(date +%s)
+            timestamp=$((timestamp*1000))
+            aws logs put-log-events --log-group-name ${AAOSLogGroup} --region ${AWS::Region} --log-stream-name ${AAOSTargetStream} --log-events timestamp="$timestamp",message="Step 6 of 6 - AAOS is running and Interface created - Rebooting the instance once reboot is complete AAOS will be available at provided address"
+            aws s3 cp /var/log/cloud-init-output.log s3://${AAOSBucket}/target-cloud-init-output.log
+            /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AAOSTargetInstance --region ${AWS::Region}
+            sleep 5
+            reboot
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT3H30M
+            
+Outputs:
+  AAOSS3BucketName:
+    Description: The S3 Bucket created by the AAOS CloudFormation Stack
+    Value: !Ref AAOSBucket
+  AAOSTargetInstance:
+    Description: The Graviton Powered Instance created to host the Android Automotive OS.
+    Value: !Ref AAOSTargetInstance
+  AAOSBuildInstance:
+    Description: The instance created to build the Android Automotive operating system from source
+    Value: !Ref AAOSBuildInstance
+  AAOSBuildLogStream:
+    Description: The build instance log stream, where you can view the summerised output from the build process
+    Value: !Ref AAOSBuildStream
+  AAOSTargetLogStream:
+    Description: The target instance log stream, where you can view the output from the target instance configuration
+    Value: !Ref AAOSTargetStream
+  AAOSWebInterface:
+    Description: The web address from which you can access the Android Automotive OS once the build process completes (Around 2 hours from Stack Deployment)
+    Value: !Sub 'https://${AAOSTargetInstance.PublicIp}:8443'
